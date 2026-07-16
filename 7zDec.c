@@ -5,7 +5,8 @@
 
 #include <string.h>
 
-/* #define Z7_PPMD_SUPPORT */
+/* SSP: enable PPMd decoding (requires Ppmd7.c / Ppmd7Dec.c to be linked) */
+#define Z7_PPMD_SUPPORT
 
 #include "7z.h"
 #include "7zCrc.h"
@@ -16,6 +17,10 @@
 #include "Delta.h"
 #include "LzmaDec.h"
 #include "Lzma2Dec.h"
+
+/* SSP: AES-256-CBC / SHA-256 for 7zAES are provided by OpenSSL (see Sz7zAes_* below) */
+#include <openssl/evp.h>
+#include <openssl/rand.h>
 #ifdef Z7_PPMD_SUPPORT
 #include "Ppmd7.h"
 #endif
@@ -628,6 +633,423 @@ static SRes SzFolder_Decode2(const CSzFolder *folder,
 }
 
 
+/* ---------------------------------------------------------------------------
+   SSP patch: 7z AES-256 (MethodID 0x06F10701) decode support.
+
+   The public C SDK cannot decode AES-encrypted 7z folders. This block adds a
+   password-driven AES-CBC decryptor. The approach is: bulk-decrypt the single
+   encrypted pack stream into a temp buffer, rewrite the folder definition with
+   the AES coder removed, and re-run the decrypted data through the existing
+   SzFolder_Decode2. This keeps all coder/BCJ/Delta/CRC validation intact and
+   touches only one branch in SzAr_DecodeFolder (below). The encrypted-header
+   case (kEncodedHeader) also flows through SzAr_DecodeFolder, so it is handled
+   automatically. Wrong passwords surface as SZ_ERROR_CRC / SZ_ERROR_DATA via
+   the existing folder-CRC check.
+--------------------------------------------------------------------------- */
+
+#define k_AES 0x6F10701
+
+#define SZ7ZAES_MAX_PASSWORD_BYTES 2048
+
+static Byte   g_7zAesPassword[SZ7ZAES_MAX_PASSWORD_BYTES];
+static size_t g_7zAesPasswordSize = 0;
+static int    g_7zAesUsed = 0;
+
+void Sz7zAes_SetPassword(const Byte *utf16lePassword, size_t sizeInBytes)
+{
+  if (!utf16lePassword || sizeInBytes == 0)
+  {
+    g_7zAesPasswordSize = 0;
+    return;
+  }
+  if (sizeInBytes > SZ7ZAES_MAX_PASSWORD_BYTES)
+    sizeInBytes = SZ7ZAES_MAX_PASSWORD_BYTES;
+  memcpy(g_7zAesPassword, utf16lePassword, sizeInBytes);
+  g_7zAesPasswordSize = sizeInBytes;
+}
+
+int  Sz7zAes_WasUsed(void)  { return g_7zAesUsed; }
+void Sz7zAes_ResetUsed(void) { g_7zAesUsed = 0; }
+
+static int Sz7zAes_FindAesCoder(const CSzFolder *f)
+{
+  unsigned i;
+  for (i = 0; i < f->NumCoders; i++)
+    if (f->Coders[i].MethodID == k_AES && f->Coders[i].NumStreams == 1)
+      return (int)i;
+  return -1;
+}
+
+/* SHA-256 based 7zAES key derivation (the numCyclesPower != 0x3F path, shared by
+   both decrypt and encrypt). key = final digest of 2^numCyclesPower rounds of
+   SHA256(salt || password || counterLE8); password is the UTF-16LE bytes set by
+   Sz7zAes_SetPassword. */
+static SRes Sz7zAes_DeriveKey(const Byte *salt, unsigned saltSize, unsigned numCyclesPower, Byte key[32])
+{
+  EVP_MD_CTX *sha = EVP_MD_CTX_new();
+  Byte ctr[8];
+  UInt64 numRounds = (UInt64)1 << numCyclesPower;
+  unsigned int outLen = 0;
+  if (!sha)
+    return SZ_ERROR_MEM;
+  memset(ctr, 0, 8);
+  EVP_DigestInit_ex(sha, EVP_sha256(), NULL);
+  do
+  {
+    unsigned i;
+    EVP_DigestUpdate(sha, salt, saltSize);
+    EVP_DigestUpdate(sha, g_7zAesPassword, g_7zAesPasswordSize);
+    EVP_DigestUpdate(sha, ctr, 8);
+    for (i = 0; i < 8; i++)
+      if (++ctr[i] != 0)
+        break;
+  }
+  while (--numRounds != 0);
+  EVP_DigestFinal_ex(sha, key, &outLen);
+  EVP_MD_CTX_free(sha);
+  return SZ_OK;
+}
+
+/* Derive the AES-256 key and IV from 7zAES coder properties + current password
+   (password is the UTF-16LE byte sequence set by Sz7zAes_SetPassword). */
+static SRes Sz7zAes_CalcKeyIv(const Byte *props, unsigned propsSize, Byte key[32], Byte iv[16])
+{
+  unsigned numCyclesPower;
+  unsigned saltSize, ivSize;
+  const Byte *salt;
+  const Byte *ivData;
+  Byte firstByte;
+
+  if (propsSize < 1)
+    return SZ_ERROR_UNSUPPORTED;
+  firstByte = props[0];
+  numCyclesPower = (unsigned)(firstByte & 0x3F);
+
+  if ((firstByte & 0xC0) == 0)
+  {
+    saltSize = 0;
+    ivSize = 0;
+    salt = props + 1;
+    ivData = props + 1;
+  }
+  else
+  {
+    if (propsSize < 2)
+      return SZ_ERROR_UNSUPPORTED;
+    saltSize = (unsigned)((firstByte >> 7) & 1) + (unsigned)(props[1] >> 4);
+    ivSize   = (unsigned)((firstByte >> 6) & 1) + (unsigned)(props[1] & 0x0F);
+    if ((size_t)2 + saltSize + ivSize > propsSize)
+      return SZ_ERROR_UNSUPPORTED;
+    salt = props + 2;
+    ivData = props + 2 + saltSize;
+  }
+
+  if (ivSize > 16)
+    return SZ_ERROR_UNSUPPORTED;
+
+  memset(iv, 0, 16);
+  memcpy(iv, ivData, ivSize);
+
+  if (numCyclesPower == 0x3F)
+  {
+    /* special: key = salt || password, zero padded to 32 bytes */
+    unsigned pos = 0;
+    unsigned i;
+    memset(key, 0, 32);
+    for (i = 0; i < saltSize && pos < 32; i++)
+      key[pos++] = salt[i];
+    for (i = 0; (size_t)i < g_7zAesPasswordSize && pos < 32; i++)
+      key[pos++] = g_7zAesPassword[i];
+  }
+  else
+  {
+    SRes res = Sz7zAes_DeriveKey(salt, saltSize, numCyclesPower, key);
+    if (res != SZ_OK)
+      return res;
+  }
+  return SZ_OK;
+}
+
+/* AES-256-CBC in-place decrypt of a 16-byte-multiple buffer.
+   Failure leaves garbage in the buffer, which the existing folder-CRC
+   check downstream reports as SZ_ERROR_CRC. */
+static void Sz7zAes_Decrypt(const Byte key[32], const Byte iv[16], Byte *data, size_t size)
+{
+  EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
+  int outLen = 0;
+  if (!ctx)
+    return;
+  if (EVP_DecryptInit_ex(ctx, EVP_aes_256_cbc(), NULL, key, iv))
+  {
+    EVP_CIPHER_CTX_set_padding(ctx, 0);
+    EVP_DecryptUpdate(ctx, data, &outLen, data, (int)size);
+  }
+  EVP_CIPHER_CTX_free(ctx);
+}
+
+/* 7zAES encryption (SSP): the OpenSSL counterpart of Sz7zAes_Decrypt, used by the
+   compressor (C7zipper). Generates a random 16-byte IV, derives the AES-256 key
+   from the password set via Sz7zAes_SetPassword (numCyclesPower=19, no salt --
+   matching 7-Zip defaults), and AES-256-CBC encrypts `size` bytes (must be a
+   16-byte multiple; the caller zero-pads) in place. Emits the 7zAES coder
+   properties (18 bytes: numCyclesPower flag byte, size nibble byte, 16-byte IV)
+   into props. Keeping this here confines OpenSSL to the C SDK, out of the C++ TU. */
+SRes Sz7zAes_Encode(Byte *data, size_t size, Byte *props, unsigned *pPropsSize)
+{
+  const unsigned numCyclesPower = 19;
+  Byte key[32];
+  Byte iv[16];
+  EVP_CIPHER_CTX *ctx;
+  int outLen = 0;
+  SRes res;
+
+  if (g_7zAesPasswordSize == 0)
+    return SZ_ERROR_PARAM;
+  if ((size & 15) != 0)
+    return SZ_ERROR_PARAM;
+  if (RAND_bytes(iv, 16) != 1)
+    return SZ_ERROR_FAIL;
+
+  /* coder props: numCyclesPower | 0x40 (iv-size high bit) + props[1]=0x0F
+     -> saltSize = 0, ivSize = 1 + 15 = 16. Mirrors Sz7zAes_CalcKeyIv parsing. */
+  props[0] = (Byte)(numCyclesPower | 0x40);
+  props[1] = 0x0F;
+  memcpy(props + 2, iv, 16);
+  *pPropsSize = 18;
+
+  res = Sz7zAes_DeriveKey(NULL, 0, numCyclesPower, key);
+  if (res != SZ_OK)
+    return res;
+
+  ctx = EVP_CIPHER_CTX_new();
+  if (!ctx)
+    return SZ_ERROR_MEM;
+  res = SZ_OK;
+  if (EVP_EncryptInit_ex(ctx, EVP_aes_256_cbc(), NULL, key, iv))
+  {
+    EVP_CIPHER_CTX_set_padding(ctx, 0);
+    if (size != 0 && !EVP_EncryptUpdate(ctx, data, &outLen, data, (int)size))
+      res = SZ_ERROR_FAIL;
+  }
+  else
+    res = SZ_ERROR_FAIL;
+  EVP_CIPHER_CTX_free(ctx);
+  return res;
+}
+
+/* memory-backed ILookInStream over the decrypted buffer */
+typedef struct
+{
+  ILookInStream vt;
+  const Byte *data;
+  size_t size;
+  size_t pos;
+} CSz7zMemInStream;
+
+static SRes Sz7zMem_Look(ILookInStreamPtr pp, const void **buf, size_t *size)
+{
+  Z7_CONTAINER_FROM_VTBL_TO_DECL_VAR_pp_vt_p(CSz7zMemInStream)
+  size_t rem = p->size - p->pos;
+  if (*size > rem)
+    *size = rem;
+  *buf = p->data + p->pos;
+  return SZ_OK;
+}
+
+static SRes Sz7zMem_Skip(ILookInStreamPtr pp, size_t offset)
+{
+  Z7_CONTAINER_FROM_VTBL_TO_DECL_VAR_pp_vt_p(CSz7zMemInStream)
+  if (offset > p->size - p->pos)
+    return SZ_ERROR_INPUT_EOF;
+  p->pos += offset;
+  return SZ_OK;
+}
+
+static SRes Sz7zMem_Read(ILookInStreamPtr pp, void *buf, size_t *size)
+{
+  Z7_CONTAINER_FROM_VTBL_TO_DECL_VAR_pp_vt_p(CSz7zMemInStream)
+  size_t rem = p->size - p->pos;
+  if (*size > rem)
+    *size = rem;
+  if (*size != 0)
+    memcpy(buf, p->data + p->pos, *size);
+  p->pos += *size;
+  return SZ_OK;
+}
+
+static SRes Sz7zMem_Seek(ILookInStreamPtr pp, Int64 *pos, ESzSeek origin)
+{
+  Z7_CONTAINER_FROM_VTBL_TO_DECL_VAR_pp_vt_p(CSz7zMemInStream)
+  Int64 np;
+  switch (origin)
+  {
+    case SZ_SEEK_SET: np = *pos; break;
+    case SZ_SEEK_CUR: np = (Int64)p->pos + *pos; break;
+    case SZ_SEEK_END: np = (Int64)p->size + *pos; break;
+    default: return SZ_ERROR_PARAM;
+  }
+  if (np < 0 || (UInt64)np > (UInt64)p->size)
+    return SZ_ERROR_PARAM;
+  p->pos = (size_t)np;
+  *pos = np;
+  return SZ_OK;
+}
+
+static SRes Sz7zAes_DecodeFolder2(const CSzFolder *folder,
+    const Byte *propsData,
+    const UInt64 *unpackSizes,
+    const UInt64 *packPositions,
+    ILookInStreamPtr inStream, UInt64 startPos,
+    Byte *outBuffer, SizeT outSize, ISzAllocPtr allocMain,
+    Byte *tempBuf[])
+{
+  int aesCiInt = Sz7zAes_FindAesCoder(folder);
+  unsigned aesCi;
+  unsigned i;
+  const CSzCoderInfo *aesCoder;
+  UInt64 encOffset, encSizeU, decSizeU;
+  size_t encSize, decSize;
+  Byte *buf;
+  SRes res;
+  CSzFolder folder2;
+  UInt64 packPositions2[2];
+  CSz7zMemInStream ms;
+  Byte key[32];
+  Byte iv[16];
+
+  g_7zAesUsed = 1;
+
+  if (aesCiInt < 0)
+    return SZ_ERROR_UNSUPPORTED;
+  aesCi = (unsigned)aesCiInt;
+
+  if (g_7zAesPasswordSize == 0)
+    return SZ_ERROR_UNSUPPORTED;
+
+  /* Linear single-stream chains only: every coder has exactly one in/out
+     stream, so stream index == coder index. The folder's single pack stream
+     must feed the AES coder. 7-Zip writes the AES coder FIRST in the folder
+     (e.g. [AES], [AES,LZMA2], [AES,LZMA2,BCJ] with UnpackStream at the end);
+     the removal below remaps indices, so any AES position is accepted. */
+  if (folder->NumPackStreams != 1)
+    return SZ_ERROR_UNSUPPORTED;
+  for (i = 0; i < folder->NumCoders; i++)
+    if (folder->Coders[i].NumStreams != 1)
+      return SZ_ERROR_UNSUPPORTED;
+  if (folder->PackStreams[0] != aesCi)
+    return SZ_ERROR_UNSUPPORTED;
+
+  aesCoder = &folder->Coders[aesCi];
+
+  encOffset = packPositions[0];
+  encSizeU = packPositions[1] - encOffset;
+  decSizeU = unpackSizes[aesCi];
+
+  encSize = (size_t)encSizeU;
+  decSize = (size_t)decSizeU;
+  if ((UInt64)encSize != encSizeU || (UInt64)decSize != decSizeU)
+    return SZ_ERROR_MEM;
+  if (encSize == 0 || (encSize & 15) != 0 || decSize > encSize)
+    return SZ_ERROR_DATA;
+
+  buf = (Byte *)ISzAlloc_Alloc(allocMain, encSize);
+  if (!buf)
+    return SZ_ERROR_MEM;
+
+  res = LookInStream_SeekTo(inStream, startPos + encOffset);
+  if (res == SZ_OK)
+    res = LookInStream_Read2(inStream, buf, encSize, SZ_ERROR_INPUT_EOF);
+  if (res == SZ_OK)
+    res = Sz7zAes_CalcKeyIv(propsData + aesCoder->PropsOffset, aesCoder->PropsSize, key, iv);
+  if (res != SZ_OK)
+  {
+    ISzAlloc_Free(allocMain, buf);
+    return res;
+  }
+
+  Sz7zAes_Decrypt(key, iv, buf, encSize);
+
+  /* rewrite the folder with the AES coder removed; the result is validated
+     against the standard supported shapes by SzFolder_Decode2 itself */
+  folder2 = *folder;
+  if (folder->NumCoders == 1)
+  {
+    /* AES alone -> a single Copy coder over the decrypted bytes */
+    if (decSize != (size_t)outSize)
+    {
+      ISzAlloc_Free(allocMain, buf);
+      return SZ_ERROR_DATA;
+    }
+    folder2.Coders[0].MethodID = k_Copy;
+    folder2.Coders[0].NumStreams = 1;
+    folder2.Coders[0].PropsOffset = 0;
+    folder2.Coders[0].PropsSize = 0;
+    folder2.NumCoders = 1;
+    folder2.NumBonds = 0;
+    folder2.NumPackStreams = 1;
+    folder2.PackStreams[0] = 0;
+    folder2.UnpackStream = 0;
+  }
+  else
+  {
+    /* drop coder aesCi and remap the remaining coder/stream indices
+       (each coder has exactly one in/out stream: stream index == coder index) */
+    #define SZ7ZAES_MAP(x) ((UInt32)((unsigned)(x) > aesCi ? (x) - 1 : (x)))
+    unsigned n = 0;
+    int packSet = 0;
+    for (i = 0; i < folder->NumCoders; i++)
+      if (i != aesCi)
+        folder2.Coders[n++] = folder->Coders[i];
+    folder2.NumCoders = n;
+    n = 0;
+    for (i = 0; i < folder->NumBonds; i++)
+    {
+      const CSzBond *b = &folder->Bonds[i];
+      if (b->OutIndex == aesCi)
+      {
+        /* the coder that consumed AES output now reads the decrypted pack stream */
+        folder2.PackStreams[0] = SZ7ZAES_MAP(b->InIndex);
+        packSet = 1;
+      }
+      else
+      {
+        folder2.Bonds[n].InIndex = SZ7ZAES_MAP(b->InIndex);
+        folder2.Bonds[n].OutIndex = SZ7ZAES_MAP(b->OutIndex);
+        n++;
+      }
+    }
+    folder2.NumBonds = n;
+    folder2.NumPackStreams = 1;
+    if (!packSet || folder->UnpackStream == aesCi)
+    {
+      ISzAlloc_Free(allocMain, buf);
+      return SZ_ERROR_UNSUPPORTED;
+    }
+    folder2.UnpackStream = SZ7ZAES_MAP(folder->UnpackStream);
+    #undef SZ7ZAES_MAP
+  }
+
+  packPositions2[0] = 0;
+  packPositions2[1] = decSize;
+
+  ms.vt.Look = Sz7zMem_Look;
+  ms.vt.Skip = Sz7zMem_Skip;
+  ms.vt.Read = Sz7zMem_Read;
+  ms.vt.Seek = Sz7zMem_Seek;
+  ms.data = buf;
+  ms.size = decSize;
+  ms.pos = 0;
+
+  res = SzFolder_Decode2(&folder2, propsData, unpackSizes, packPositions2,
+      &ms.vt, 0, outBuffer, outSize, allocMain, tempBuf);
+
+  ISzAlloc_Free(allocMain, buf);
+  return res;
+}
+
+/* ------------------------- end SSP 7z AES patch ------------------------- */
+
+
 SRes SzAr_DecodeFolder(const CSzAr *p, UInt32 folderIndex,
     ILookInStreamPtr inStream, UInt64 startPos,
     Byte *outBuffer, size_t outSize,
@@ -654,6 +1076,14 @@ SRes SzAr_DecodeFolder(const CSzAr *p, UInt32 folderIndex,
     unsigned i;
     Byte *tempBuf[3] = { 0, 0, 0};
 
+    /* SSP: route AES-encrypted folders through the patched decoder */
+    if (Sz7zAes_FindAesCoder(&folder) >= 0)
+      res = Sz7zAes_DecodeFolder2(&folder, data,
+          &p->CoderUnpackSizes[p->FoToCoderUnpackSizes[folderIndex]],
+          p->PackPositions + p->FoStartPackStreamIndex[folderIndex],
+          inStream, startPos,
+          outBuffer, (SizeT)outSize, allocMain, tempBuf);
+    else
     res = SzFolder_Decode2(&folder, data,
         &p->CoderUnpackSizes[p->FoToCoderUnpackSizes[folderIndex]],
         p->PackPositions + p->FoStartPackStreamIndex[folderIndex],
