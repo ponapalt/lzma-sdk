@@ -966,6 +966,8 @@ void XzUnpacker_Construct(CXzUnpacker *p, ISzAllocPtr alloc)
   MixCoder_Construct(&p->decoder, alloc);
   p->outBuf = NULL;
   p->outBufSize = 0;
+  p->sha = NULL;         /* SSP: lazily allocated OpenSSL EVP_MD_CTX* */
+  p->check.sha = NULL;   /* SSP: lazily allocated OpenSSL EVP_MD_CTX* */
   XzUnpacker_Init(p);
 }
 
@@ -973,6 +975,8 @@ void XzUnpacker_Construct(CXzUnpacker *p, ISzAllocPtr alloc)
 void XzUnpacker_Free(CXzUnpacker *p)
 {
   MixCoder_Free(&p->decoder);
+  XzSha256_Free(&p->sha);         /* SSP: release OpenSSL EVP_MD_CTX */
+  XzSha256_Free(&p->check.sha);   /* SSP: release OpenSSL EVP_MD_CTX */
 }
 
 
@@ -980,7 +984,7 @@ void XzUnpacker_PrepareToRandomBlockDecoding(CXzUnpacker *p)
 {
   p->indexSize = 0;
   p->numBlocks = 0;
-  Sha256_Init(&p->sha);
+  XzSha256_Init(&p->sha);
   p->state = XZ_STATE_BLOCK_HEADER;
   p->pos = 0;
   p->decodeOnlyOneBlock = 1;
@@ -992,7 +996,7 @@ static void XzUnpacker_UpdateIndex(CXzUnpacker *p, UInt64 packSize, UInt64 unpac
   Byte temp[32];
   unsigned num = Xz_WriteVarInt(temp, packSize);
   num += Xz_WriteVarInt(temp + num, unpackSize);
-  Sha256_Update(&p->sha, temp, num);
+  XzSha256_Update(&p->sha, temp, num);
   p->indexSize += num;
   p->numBlocks++;
 }
@@ -1132,7 +1136,7 @@ SRes XzUnpacker_Code(CXzUnpacker *p, Byte *dest, SizeT *destLen,
           p->numStartedStreams++;
           p->indexSize = 0;
           p->numBlocks = 0;
-          Sha256_Init(&p->sha);
+          XzSha256_Init(&p->sha);
           p->state = XZ_STATE_BLOCK_HEADER;
           p->pos = 0;
         }
@@ -1152,8 +1156,8 @@ SRes XzUnpacker_Code(CXzUnpacker *p, Byte *dest, SizeT *destLen,
             p->indexPreSize = 1 + Xz_WriteVarInt(p->buf + 1, p->numBlocks);
             p->indexPos = p->indexPreSize;
             p->indexSize += p->indexPreSize;
-            Sha256_Final(&p->sha, (Byte *)(void *)p->shaDigest32);
-            Sha256_Init(&p->sha);
+            XzSha256_Final(&p->sha, (Byte *)(void *)p->shaDigest32);
+            XzSha256_Init(&p->sha);
             p->crc = CrcUpdate(CRC_INIT_VAL, p->buf, p->indexPreSize);
             p->state = XZ_STATE_STREAM_INDEX;
             break;
@@ -1258,7 +1262,7 @@ SRes XzUnpacker_Code(CXzUnpacker *p, Byte *dest, SizeT *destLen,
             if (srcRem > cur)
               srcRem = (SizeT)cur;
             p->crc = CrcUpdate(p->crc, src, srcRem);
-            Sha256_Update(&p->sha, src, srcRem);
+            XzSha256_Update(&p->sha, src, srcRem);
             (*srcLen) += srcRem;
             src += srcRem;
             p->indexPos += srcRem;
@@ -1275,12 +1279,12 @@ SRes XzUnpacker_Code(CXzUnpacker *p, Byte *dest, SizeT *destLen,
           }
           else
           {
-            UInt32 digest32[SHA256_DIGEST_SIZE / 4];
+            UInt32 digest32[XZ_SHA256_DIGEST_SIZE / 4];
             p->state = XZ_STATE_STREAM_INDEX_CRC;
             p->indexSize += 4;
             p->pos = 0;
-            Sha256_Final(&p->sha, (Byte *)(void *)digest32);
-            if (memcmp(digest32, p->shaDigest32, SHA256_DIGEST_SIZE) != 0)
+            XzSha256_Final(&p->sha, (Byte *)(void *)digest32);
+            if (memcmp(digest32, p->shaDigest32, XZ_SHA256_DIGEST_SIZE) != 0)
               return SZ_ERROR_CRC;
           }
         }

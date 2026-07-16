@@ -4,10 +4,20 @@ Igor Pavlov : Public domain */
 #ifndef ZIP7_INC_XZ_H
 #define ZIP7_INC_XZ_H
 
-#include "Sha256.h"
+#include "7zTypes.h"
 #include "Delta.h"
 
 EXTERN_C_BEGIN
+
+/* SSP: SHA-256 for the xz integrity check is provided by OpenSSL (see XzSha256_*
+   in Xz.c). The context is kept as an opaque pointer so OpenSSL stays out of this
+   header and any C++ TU that includes it. */
+#define XZ_SHA256_DIGEST_SIZE 32
+
+void XzSha256_Init(void **pp);
+void XzSha256_Update(void **pp, const void *data, size_t size);
+void XzSha256_Final(void **pp, Byte *digest);   /* digest must be 32 bytes */
+void XzSha256_Free(void **pp);
 
 #define XZ_ID_Subblock 1
 #define XZ_ID_Delta 3
@@ -89,7 +99,7 @@ typedef struct
   unsigned mode;
   UInt32 crc;
   UInt64 crc64;
-  CSha256 sha;
+  void *sha;   /* OpenSSL EVP_MD_CTX*, managed by XzSha256_* */
 } CXzCheck;
 
 void XzCheck_Init(CXzCheck *p, unsigned mode);
@@ -263,7 +273,7 @@ typedef struct
   CMixCoder decoder;
   CXzBlock block;
   CXzCheck check;
-  CSha256 sha;
+  void *sha;   /* OpenSSL EVP_MD_CTX*, managed by XzSha256_* */
 
   BoolInt parseMode;
   BoolInt headerParsedOk;
@@ -274,7 +284,7 @@ typedef struct
   size_t outBufSize;
   size_t outDataWritten; // the size of data in (outBuf) that were fully unpacked
 
-  UInt32 shaDigest32[SHA256_DIGEST_SIZE / 4];
+  UInt32 shaDigest32[XZ_SHA256_DIGEST_SIZE / 4];
   Byte buf[XZ_BLOCK_HEADER_SIZE_MAX]; // it must be aligned for 4-bytes
 } CXzUnpacker;
 
