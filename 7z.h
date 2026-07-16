@@ -199,6 +199,20 @@ SZ_ERROR_FAIL
 SRes SzArEx_Open(CSzArEx *p, ILookInStreamPtr inStream,
     ISzAllocPtr allocMain, ISzAllocPtr allocTemp);
 
+/* SSP patch: 7z AES (MethodID 0x06F10701) support.
+   Set the password (UTF-16LE bytes) before SzArEx_Open / SzArEx_Extract on an
+   encrypted archive; pass NULL/0 to clear it. Sz7zAes_WasUsed reports whether an
+   AES coder was encountered since the last Sz7zAes_ResetUsed (used to detect that
+   an archive open needed a password, e.g. an encrypted header). */
+void Sz7zAes_SetPassword(const Byte *utf16lePassword, size_t sizeInBytes);
+int  Sz7zAes_WasUsed(void);
+void Sz7zAes_ResetUsed(void);
+
+/* Encrypt for the writer side (C7zipper). Set the password via
+   Sz7zAes_SetPassword first, then encrypt a 16-byte-multiple buffer in place;
+   props (>=18 bytes) receives the 7zAES coder properties to store in the folder. */
+SRes Sz7zAes_Encode(Byte *data, size_t size, Byte *props, unsigned *pPropsSize);
+
 EXTERN_C_END
 
 #endif
