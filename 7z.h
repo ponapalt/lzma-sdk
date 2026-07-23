@@ -102,6 +102,53 @@ SRes SzAr_DecodeFolder(const CSzAr *p, UInt32 folderIndex,
     Byte *outBuffer, size_t outSize,
     ISzAllocPtr allocMain);
 
+/* SSP patch: resumable streaming folder decode.
+
+   SzAr_DecodeFolder() needs an output buffer holding the whole folder, so the
+   peak allocation is the folder's unpacked size. 7z stores the files of a solid
+   folder back to back inside one compressed stream, so that is every file of
+   the folder put together -- and it is paid even to read one small file.
+
+   CSzFolderStream decodes a folder incrementally instead, and it is resumable:
+   the caller pulls the unpacked bytes in order, stops wherever it likes (at a
+   file boundary), and resumes the same decoder for the next file. Peak memory
+   is the LZMA window (capped at the folder's unpacked size) or the PPMd model,
+   plus a 256 KiB staging buffer, and does not grow with the folder or the file.
+
+   The accepted folder shape is a linear one-pack-stream chain
+
+     pack -> [AES] -> main -> [filter] -> out
+
+   with main = Copy / LZMA / LZMA2 / PPMd, AES = 7zAES (CBC, so it decrypts on
+   the fly) and filter = Delta / BCJ / PPC / IA64 / ARM / ARMT / ARM64 / SPARC /
+   RISCV. BCJ2 (four pack streams) and any other graph give SZ_ERROR_UNSUPPORTED
+   and the caller must fall back to SzArEx_Extract for those.
+   SzAr_IsFolderStreamable() reports the same decision without decoding, so a
+   caller can choose the path up front.
+
+   Peek() hands out the next run of unpacked bytes without consuming them (the
+   returned pointer stays valid until the next Peek); Consume() takes however
+   much of it the caller used and rolls the folder CRC over those bytes. A
+   returned size of 0 is the end of the folder. Finish() verifies the folder CRC
+   once everything has been consumed, i.e. after the bytes have already been
+   handed out, so a caller that must not publish unverified data has to stage
+   its output (write to a temporary file and rename it only on success) and to
+   check its own per-file digest as well.
+
+   The stream owns its position in the ILookInStream it was created on: nothing
+   else may read or seek that stream while the folder stream is alive. */
+
+typedef struct CSzFolderStream CSzFolderStream;
+
+int SzAr_IsFolderStreamable(const CSzAr *p, UInt32 folderIndex);
+
+SRes SzAr_FolderStream_Create(CSzFolderStream **pp, const CSzAr *p, UInt32 folderIndex,
+    ILookInStreamPtr stream, UInt64 startPos, ISzAllocPtr alloc);
+SRes SzAr_FolderStream_Peek(CSzFolderStream *p, const Byte **data, size_t *size);
+SRes SzAr_FolderStream_Consume(CSzFolderStream *p, size_t size);
+SRes SzAr_FolderStream_Finish(CSzFolderStream *p);
+void SzAr_FolderStream_Free(CSzFolderStream *p);
+
 typedef struct
 {
   CSzAr db;
